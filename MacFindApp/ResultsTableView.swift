@@ -3,13 +3,20 @@ import MacFindKit
 import QuickLookUI
 import SwiftUI
 
+/// SwiftUI/VM 侧按需读取或操作表格选中态,**不让选中态经 SwiftUI 广播**
+/// (否则每次点选都会重渲染并与 NSTableView 抢选中态,造成可见卡顿)。
+final class ResultsTableHandle {
+    var currentItem: (() -> ResultItem?)?
+    var selectFirstRow: (() -> Void)?
+}
+
 /// 结果列表:AppKit `NSTableView`(设计文档 §3/§17)。
 ///
-/// 用 AppKit 而非 SwiftUI `Table`,是为了支持**行拖拽导出文件**
-/// (`pasteboardWriterForRow` 提供 file URL),以及双击打开、右键菜单、Return 打开。
+/// 功能:行拖拽导出、拖到废纸篓、双击/Return 打开、Space QuickLook、右键菜单、**点表头排序**。
+/// 选中态完全由 NSTableView 自己持有,SwiftUI 不参与。
 struct ResultsTableView: NSViewRepresentable {
     var items: [ResultItem]
-    @Binding var selection: Set<ResultItem.ID>
+    var handle: ResultsTableHandle?
     var onOpen: (ResultItem) -> Void
     var onTrash: (ResultItem) -> Void
 
@@ -26,17 +33,20 @@ struct ResultsTableView: NSViewRepresentable {
         tableView.target = context.coordinator
         tableView.doubleAction = #selector(Coordinator.doubleClicked(_:))
         tableView.menu = context.coordinator.makeContextMenu()
-        // 允许把结果拖到 Finder / 其他 App;`.delete` 是「拖到废纸篓」所必需的
-        tableView.setDraggingSourceOperationMask([.copy, .delete], forLocal: false)
+        tableView.setDraggingSourceOperationMask([.copy, .delete], forLocal: false)   // .delete:拖到废纸篓
         tableView.onSpace = { [weak coordinator = context.coordinator] in coordinator?.togglePreview() }
-        context.coordinator.tableView = tableView
 
-        Self.addColumn(to: tableView, id: .name, title: "名称", width: 320, min: 180, max: 900)
-        Self.addColumn(to: tableView, id: .size, title: "大小", width: 90, min: 60, max: 120)
-        Self.addColumn(to: tableView, id: .date, title: "修改时间", width: 150, min: 120, max: 200)
-        Self.addColumn(to: tableView, id: .path, title: "路径", width: 380, min: 200, max: 1200)
+        Self.addColumn(to: tableView, id: .name, title: "名称", width: 320, min: 180, max: 900, sortKey: "name")
+        Self.addColumn(to: tableView, id: .size, title: "大小", width: 90, min: 60, max: 120, sortKey: "size")
+        Self.addColumn(to: tableView, id: .date, title: "修改时间", width: 150, min: 120, max: 200, sortKey: "date")
+        Self.addColumn(to: tableView, id: .path, title: "路径", width: 380, min: 200, max: 1200, sortKey: "path")
         tableView.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
         tableView.headerView = NSTableHeaderView()
+        tableView.sortDescriptors = context.coordinator.sortDescriptors   // 显示排序指示器
+
+        context.coordinator.tableView = tableView
+        handle?.currentItem = { [weak coordinator = context.coordinator] in coordinator?.currentItem() }
+        handle?.selectFirstRow = { [weak coordinator = context.coordinator] in coordinator?.selectFirstRow() }
 
         let scroll = NSScrollView()
         scroll.documentView = tableView
@@ -52,21 +62,24 @@ struct ResultsTableView: NSViewRepresentable {
         guard let tableView = scrollView.documentView as? NSTableView else { return }
 
         let ids = items.map(\.id)
-        if ids != context.coordinator.lastIDs {
-            context.coordinator.lastIDs = ids
-            tableView.reloadData()
-        }
-        context.coordinator.reconcileSelection(in: tableView)
+        guard ids != context.coordinator.lastIDs else { return }   // 结果集没变就啥都不做
+        let keepID = context.coordinator.currentItem()?.id
+        context.coordinator.lastIDs = ids
+        context.coordinator.reset(to: items)
+        tableView.reloadData()
+        context.coordinator.restoreSelection(keepID, in: tableView)
     }
 
     private static func addColumn(to tableView: NSTableView, id: NSUserInterfaceItemIdentifier,
-                                  title: String, width: CGFloat, min: CGFloat, max: CGFloat) {
+                                  title: String, width: CGFloat, min: CGFloat, max: CGFloat,
+                                  sortKey: String) {
         let column = NSTableColumn(identifier: id)
         column.title = title
         column.width = width
         column.minWidth = min
         column.maxWidth = max
         column.resizingMask = .autoresizingMask
+        column.sortDescriptorPrototype = NSSortDescriptor(key: sortKey, ascending: sortKey == "date" ? false : true)
         tableView.addTableColumn(column)
     }
 
@@ -77,30 +90,84 @@ struct ResultsTableView: NSViewRepresentable {
         var parent: ResultsTableView
         weak var tableView: NSTableView?
         var lastIDs: [String] = []
-        private var isSyncingSelection = false
+
+        /// 当前显示顺序(在 `items` 基础上应用排序)。
+        private var displayItems: [ResultItem] = []
+        var sortDescriptors: [NSSortDescriptor] = [NSSortDescriptor(key: "date", ascending: false)]
 
         init(_ parent: ResultsTableView) { self.parent = parent }
 
-        var items: [ResultItem] { parent.items }
+        // MARK: 数据/排序
 
-        // MARK: DataSource
+        func reset(to newItems: [ResultItem]) {
+            displayItems = newItems
+            applyCurrentSort()
+        }
 
-        func numberOfRows(in tableView: NSTableView) -> Int { items.count }
+        private func applyCurrentSort() {
+            let key = sortDescriptors.first?.key ?? "date"
+            let ascending = sortDescriptors.first?.ascending ?? false
+            displayItems.sort { a, b in
+                let c = Self.compare(a, b, key: key)
+                if c == .orderedSame { return a.path < b.path }   // 稳定:同名按路径
+                return ascending ? c == .orderedAscending : c == .orderedDescending
+            }
+        }
 
-        /// 拖拽导出:提供文件 URL(多选拖拽时 AppKit 会逐行调用)。
+        private static func compare(_ a: ResultItem, _ b: ResultItem, key: String) -> ComparisonResult {
+            switch key {
+            case "name": return a.name.localizedStandardCompare(b.name)
+            case "size": return a.size == b.size ? .orderedSame : (a.size < b.size ? .orderedAscending : .orderedDescending)
+            case "path": return a.path.localizedStandardCompare(b.path)
+            default:
+                if a.modified == b.modified { return .orderedSame }
+                return a.modified < b.modified ? .orderedAscending : .orderedDescending
+            }
+        }
+
+        func tableView(_ tableView: NSTableView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
+            sortDescriptors = tableView.sortDescriptors
+            applyCurrentSort()
+            tableView.reloadData()
+        }
+
+        func numberOfRows(in tableView: NSTableView) -> Int { displayItems.count }
+
+        /// 拖拽导出:提供文件 URL(多选拖拽时 AppKit 逐行调用)。
         func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
-            guard row >= 0, row < items.count else { return nil }
+            guard row >= 0, row < displayItems.count else { return nil }
             let pb = NSPasteboardItem()
-            pb.setString(items[row].url.absoluteString, forType: .fileURL)
-            pb.setString(items[row].path, forType: .string)
+            pb.setString(displayItems[row].url.absoluteString, forType: .fileURL)
+            pb.setString(displayItems[row].path, forType: .string)
             return pb
+        }
+
+        // MARK: 选中态(仅表格持有)
+
+        func currentItem() -> ResultItem? {
+            guard let tableView, let row = tableView.selectedRowIndexes.first, row < displayItems.count else { return nil }
+            return displayItems[row]
+        }
+
+        func selectFirstRow() {
+            guard let tableView, !displayItems.isEmpty else { return }
+            tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+            tableView.scrollRowToVisible(0)
+        }
+
+        func restoreSelection(_ id: ResultItem.ID?, in tableView: NSTableView) {
+            if let id, let row = displayItems.firstIndex(where: { $0.id == id }) {
+                tableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+            } else {
+                tableView.deselectAll(nil)
+            }
         }
 
         // MARK: Delegate
 
         func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-            guard row >= 0, row < items.count, let columnID = tableColumn?.identifier else { return nil }
-            let item = items[row]
+            guard row >= 0, row < displayItems.count, let columnID = tableColumn?.identifier else { return nil }
+            let item = displayItems[row]
 
             switch columnID {
             case .name:
@@ -134,68 +201,6 @@ struct ResultsTableView: NSViewRepresentable {
             }
         }
 
-        func tableViewSelectionDidChange(_ notification: Notification) {
-            guard !isSyncingSelection, let tableView = notification.object as? NSTableView else { return }
-            parent.selection = selectedIDs(in: tableView)
-        }
-
-        /// 外部(绑定的)选中态 → 表格
-        func reconcileSelection(in tableView: NSTableView) {
-            let desired = parent.selection
-            let current = selectedIDs(in: tableView)
-            guard desired != current else { return }
-
-            var indexes = IndexSet()
-            for (i, item) in items.enumerated() where desired.contains(item.id) { indexes.insert(i) }
-            isSyncingSelection = true
-            tableView.selectRowIndexes(indexes, byExtendingSelection: false)
-            isSyncingSelection = false
-        }
-
-        private func selectedIDs(in tableView: NSTableView) -> Set<ResultItem.ID> {
-            Set(tableView.selectedRowIndexes.compactMap { $0 < items.count ? items[$0].id : nil })
-        }
-
-        // MARK: Actions
-
-        @objc func doubleClicked(_ sender: Any?) {
-            openSelectedRow()
-        }
-
-        @objc func menuOpen(_ sender: Any?) { openSelectedRow() }
-
-        @objc func menuReveal(_ sender: Any?) {
-            guard let item = menuTargetItem() else { return }
-            NSWorkspace.shared.activateFileViewerSelecting([item.url])
-        }
-
-        @objc func menuCopyPath(_ sender: Any?) {
-            guard let item = menuTargetItem() else { return }
-            let pb = NSPasteboard.general
-            pb.clearContents()
-            pb.setString(item.path, forType: .string)
-        }
-
-        @objc func menuTrash(_ sender: Any?) {
-            guard let item = menuTargetItem() else { return }
-            parent.onTrash(item)
-        }
-
-        private func openSelectedRow() {
-            guard let item = menuTargetItem() else { return }
-            parent.onOpen(item)
-        }
-
-        /// 右键/双击作用的目标:优先点击的那一行(`clickedRow`),其次选中行,最后第一行。
-        private func menuTargetItem() -> ResultItem? {
-            if let tableView {
-                let clicked = tableView.clickedRow
-                if clicked >= 0, clicked < items.count { return items[clicked] }
-                if let sel = tableView.selectedRowIndexes.first, sel < items.count { return items[sel] }
-            }
-            return items.first
-        }
-
         // MARK: QuickLook(Space)
 
         func togglePreview() {
@@ -204,8 +209,8 @@ struct ResultsTableView: NSViewRepresentable {
                 panel.orderOut(nil)
                 return
             }
-            guard !items.isEmpty else { return }
-            if let tableView, let row = tableView.selectedRowIndexes.first, row < items.count {
+            guard !displayItems.isEmpty else { return }
+            if let tableView, let row = tableView.selectedRowIndexes.first, row < displayItems.count {
                 panel.currentPreviewItemIndex = row
             } else {
                 panel.currentPreviewItemIndex = 0
@@ -216,11 +221,11 @@ struct ResultsTableView: NSViewRepresentable {
             panel.makeKeyAndOrderFront(nil)
         }
 
-        func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int { items.count }
+        func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int { displayItems.count }
 
         func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> QLPreviewItem! {
-            guard index >= 0, index < items.count else { return nil }
-            return items[index].url as NSURL
+            guard index >= 0, index < displayItems.count else { return nil }
+            return displayItems[index].url as NSURL
         }
 
         /// Space 再按一次关闭(与系统 QuickLook 一致)。
@@ -230,6 +235,47 @@ struct ResultsTableView: NSViewRepresentable {
                 return true
             }
             return false
+        }
+
+        // MARK: Actions
+
+        /// ⚠️只有真正双击到「行」才打开;双击表头/空白区(`clickedRow < 0`)不动作。
+        @objc func doubleClicked(_ sender: Any?) {
+            guard let tableView, tableView.clickedRow >= 0 else { return }
+            openTargetItem()
+        }
+
+        @objc func menuOpen(_ sender: Any?) { openTargetItem() }
+
+        @objc func menuReveal(_ sender: Any?) {
+            guard let item = targetItem() else { return }
+            NSWorkspace.shared.activateFileViewerSelecting([item.url])
+        }
+
+        @objc func menuCopyPath(_ sender: Any?) {
+            guard let item = targetItem() else { return }
+            let pb = NSPasteboard.general
+            pb.clearContents()
+            pb.setString(item.path, forType: .string)
+        }
+
+        @objc func menuTrash(_ sender: Any?) {
+            guard let item = targetItem() else { return }
+            parent.onTrash(item)
+        }
+
+        private func openTargetItem() {
+            guard let item = targetItem() else { return }
+            parent.onOpen(item)
+        }
+
+        /// 右键作用的目标:优先点击行,其次选中行。
+        private func targetItem() -> ResultItem? {
+            if let tableView {
+                let clicked = tableView.clickedRow
+                if clicked >= 0, clicked < displayItems.count { return displayItems[clicked] }
+            }
+            return currentItem()
         }
 
         func makeContextMenu() -> NSMenu {
@@ -244,7 +290,7 @@ struct ResultsTableView: NSViewRepresentable {
             return menu
         }
 
-        // MARK: Formatting
+        // MARK: Cells
 
         private func cellView(_ tableView: NSTableView, identifier: NSUserInterfaceItemIdentifier,
                               withImage: Bool) -> NSTableCellView {

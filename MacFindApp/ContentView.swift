@@ -5,6 +5,7 @@ import SwiftUI
 /// 主面板:搜索框 + 结果表 + 状态行(设计文档 §6.1)。
 struct ContentView: View {
     @StateObject private var vm = SearchViewModel()
+    @State private var tableHandle = ResultsTableHandle()
     @FocusState private var searchFocused: Bool
 
     var body: some View {
@@ -16,7 +17,10 @@ struct ContentView: View {
             statusBar
         }
         .frame(minWidth: 760, minHeight: 440)
-        .onAppear { searchFocused = true }
+        .onAppear {
+            vm.table = tableHandle
+            searchFocused = true
+        }
     }
 
     private var searchBar: some View {
@@ -39,7 +43,7 @@ struct ContentView: View {
 
     private var resultsTable: some View {
         ResultsTableView(items: vm.results,
-                         selection: Binding(get: { vm.selected }, set: { vm.selected = $0 }),
+                         handle: tableHandle,
                          onOpen: { vm.open($0) },
                          onTrash: { vm.trash($0) })
     }

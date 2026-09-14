@@ -8,6 +8,5 @@ struct MacFindApp: App {
         WindowGroup("MacFind") {
             ContentView()
         }
-        .windowResizability(.contentSize)
     }
 }

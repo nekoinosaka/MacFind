@@ -4,19 +4,22 @@ import Foundation
 import MacFindKit
 
 /// UI 状态 + 输入 debounce + 结果操作(设计文档 §5.3 / §6)。
+///
+/// 注意:选中态**不在这里**。它由 `NSTableView` 自己持有,通过 `ResultsTableHandle`
+/// 按需读取;若把它搬进 `@Published` 走 SwiftUI 往返,点选会触发重渲染并和表格抢选中态。
 final class SearchViewModel: ObservableObject {
     @Published var queryText: String = ""
     @Published var results: [ResultItem] = []
     @Published var totalCount = 0
     @Published var elapsedMS: Double = 0
     @Published var isSearching = false
-    /// ⚠️ 故意不是 `@Published`:选中态由 NSTableView 自己持有,
-    /// 若经 SwiftUI 往返会在每次点选时重渲染 + 可能重选整片选中集(明显卡顿)。
-    var selected: Set<ResultItem.ID> = []
     /// 查询语法/目录错误;非 nil 时状态栏展示。
     @Published var parseError: String?
     /// 结果操作(如移到废纸篓)失败时的错误。
     @Published var actionError: String?
+
+    /// 由 `ContentView` 在出现时注入,用于与表格选中态交互。
+    var table: ResultsTableHandle?
 
     private let backend = SpotlightBackend()
     private var debounceWork: DispatchWorkItem?
@@ -31,11 +34,11 @@ final class SearchViewModel: ObservableObject {
             self.totalCount = self.backend.totalCount
             self.isSearching = false
             self.elapsedMS = (CFAbsoluteTimeGetCurrent() - self.searchStart) * 1000
-            if !self.selected.isEmpty, !items.contains(where: { self.selected.contains($0.id) }) {
-                self.selected = items.first.map { [$0.id] } ?? []
-            }
         }
     }
+
+    /// 当前选中的结果(直接问表格)。
+    var currentItem: ResultItem? { table?.currentItem?() }
 
     /// 输入变化:debounce ~100ms 后查询。
     func updateQuery(_ text: String) {
@@ -64,7 +67,6 @@ final class SearchViewModel: ObservableObject {
         parseError = nil
         actionError = nil
         if q.isEmpty {
-            generation &+= 1
             backend.stop()
             results = []
             totalCount = 0
@@ -86,25 +88,22 @@ final class SearchViewModel: ObservableObject {
         isSearching = false
     }
 
-    // MARK: - 结果操作(§7)
+    // MARK: - 结果操作(设计文档 §7)
 
-    var selectedItem: ResultItem? {
-        if let first = selected.first, let item = results.first(where: { $0.id == first }) { return item }
-        return results.first
-    }
-
-    /// 搜索框回车:未选中时选中第一条(安全);已选中时才打开。
-    /// 避免「敲完字按回车 → 误开第一条文件(可能是脚本)」。
+    /// 搜索框回车:已选中则打开,否则选中第一条(避免误开)。
     func handleSubmit() {
-        if selected.isEmpty {
-            selected = results.first.map { [$0.id] } ?? []
+        if let item = currentItem {
+            open(item)
         } else {
-            openSelected()
+            table?.selectFirstRow?()
         }
     }
 
     func open(_ item: ResultItem) {
-        NSWorkspace.shared.open(item.url)
+        // 异步打开:`-[NSWorkspace openURL:]` 会同步阻塞主线程(实测 ~290ms 的 LaunchServices 调用)
+        NSWorkspace.shared.open(item.url, configuration: NSWorkspace.OpenConfiguration()) { _, error in
+            if let error { NSLog("MacFind open failed: %@", error.localizedDescription) }
+        }
     }
 
     func reveal(_ item: ResultItem) {
@@ -117,31 +116,21 @@ final class SearchViewModel: ObservableObject {
         pb.setString(item.path, forType: .string)
     }
 
-    /// 移到废纸篓(可恢复),成功后立即从当前结果里移除。
+    /// 移到废纸篓(可恢复),成功后从当前结果里移除。文件操作用后台队列,避免卡主线程。
     func trash(_ item: ResultItem) {
-        do {
-            try FileManager.default.trashItem(at: item.url, resultingItemURL: nil)
-            actionError = nil
-            results.removeAll { $0.id == item.id }
-            totalCount = max(0, totalCount - 1)
-            selected.remove(item.id)
-        } catch {
-            actionError = "移到废纸篓失败:\(error.localizedDescription)"
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                try FileManager.default.trashItem(at: item.url, resultingItemURL: nil)
+                DispatchQueue.main.async {
+                    self.actionError = nil
+                    self.results.removeAll { $0.id == item.id }
+                    self.totalCount = max(0, self.totalCount - 1)
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.actionError = "移到废纸篓失败:\(error.localizedDescription)"
+                }
+            }
         }
-    }
-
-    func openSelected() {
-        guard let item = selectedItem else { return }
-        open(item)
-    }
-
-    func revealSelected() {
-        guard let item = selectedItem else { return }
-        reveal(item)
-    }
-
-    func copySelectedPath() {
-        guard let item = selectedItem else { return }
-        copyPath(item)
     }
 }
