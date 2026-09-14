@@ -28,7 +28,7 @@ struct ContentView: View {
                 .textFieldStyle(.plain)
                 .font(.system(size: 15))
                 .focused($searchFocused)
-                .onSubmit { vm.openSelected() }
+                .onSubmit { vm.handleSubmit() }
             if vm.isSearching {
                 ProgressView().controlSize(.small)
             }
@@ -84,7 +84,10 @@ struct ContentView: View {
 
     private var statusBar: some View {
         HStack {
-            if vm.results.isEmpty {
+            if let error = vm.parseError {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+            } else if vm.results.isEmpty {
                 Text(vm.isSearching ? "搜索中…" : "无匹配")
             } else {
                 Text("\(vm.totalCount) 条匹配" + (vm.totalCount > vm.results.count ? " · 显示前 \(vm.results.count)" : ""))
@@ -93,7 +96,7 @@ struct ContentView: View {
             Text(String(format: "%.0f ms", vm.elapsedMS))
         }
         .font(.caption)
-        .foregroundStyle(.secondary)
+        .foregroundStyle(vm.parseError == nil ? Color.secondary : Color.orange)
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
     }
@@ -121,15 +124,25 @@ struct ContentView: View {
         pb.setString(s, forType: .string)
     }
 
+    private static let byteFormatter: ByteCountFormatter = {
+        let f = ByteCountFormatter()
+        f.countStyle = .file
+        return f
+    }()
+
+    private static let dateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm"
+        return f
+    }()
+
     static func sizeString(_ item: ResultItem) -> String {
         if item.isDirectory { return "—" }
-        return ByteCountFormatter.string(fromByteCount: item.size, countStyle: .file)
+        return byteFormatter.string(fromByteCount: item.size)
     }
 
     static func dateString(_ d: Date) -> String {
         if d == .distantPast { return "—" }
-        let f = DateFormatter()
-        f.dateFormat = "yyyy-MM-dd HH:mm"
-        return f.string(from: d)
+        return dateFormatter.string(from: d)
     }
 }

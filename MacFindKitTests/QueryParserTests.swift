@@ -40,6 +40,34 @@ final class QueryParserTests: XCTestCase {
         XCTAssertThrowsError(try SearchQuery.parse("size:>abc"))
     }
 
+    /// 回归:大数值 × 单位后缀曾触发 Int64 乘法溢出崩溃(trap),必须抛错而非崩溃。
+    func testSizeOverflowThrowsInsteadOfCrashing() {
+        XCTAssertThrowsError(try SearchQuery.parse("size:>9000000000G")) { err in
+            XCTAssertEqual(err as? QueryParseError, .invalidSize(">9000000000G"))
+        }
+        XCTAssertThrowsError(try SearchQuery.parse("size:99999999999999M"))
+        XCTAssertNoThrow(try SearchQuery.parse("size:>8G"))   // 边界内仍可用
+    }
+
+    /// 错误信息必须可读(状态栏要展示)。
+    func testParseErrorMessagesAreDescriptive() {
+        XCTAssertTrue(QueryParseError.invalidSize("x").errorDescription?.contains("size:") == true)
+        XCTAssertTrue(QueryParseError.invalidDate("x").errorDescription?.contains("date:") == true)
+        XCTAssertNotNil(QueryParseError.unterminatedQuote.errorDescription)
+    }
+
+    /// `in:` 目录校验:存在为 nil,不存在返回错误文案。
+    func testScopeValidation() throws {
+        let ok = try SearchQuery.parse("in:/Applications")
+        XCTAssertNil(ok.scopeValidationError())
+
+        let bad = try SearchQuery.parse("in:/definitely/not/here")
+        XCTAssertNotNil(bad.scopeValidationError())
+
+        let none = try SearchQuery.parse("report")
+        XCTAssertNil(none.scopeValidationError())   // 无 scope 不报错
+    }
+
     func testRelativeDate() throws {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let q = try SearchQuery.parse("date:7d", now: now)

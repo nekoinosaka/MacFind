@@ -14,12 +14,12 @@ final class SpotlightBackendTests: XCTestCase {
         let exp = expectation(description: "spotlight: \(text)")
         var items: [ResultItem] = []
         var total = 0
-        backend.onResults = { result in
+        backend.onResults = { _, result in
             items = result
             total = backend.totalCount
             exp.fulfill()
         }
-        backend.search(query)
+        backend.search(query, token: 1)
         wait(for: [exp], timeout: timeout)
         return (items, total)
     }
@@ -28,8 +28,35 @@ final class SpotlightBackendTests: XCTestCase {
     func testMatchAllPredicateIsValid() {
         let backend = SpotlightBackend(maxResults: 1)
         let exp = expectation(description: "matchAll")
-        backend.onResults = { _ in exp.fulfill() }
+        backend.onResults = { _, _ in exp.fulfill() }
         backend.search(SearchQuery())   // 空查询 → 走 matchAll
+        wait(for: [exp], timeout: 15)
+    }
+
+    /// 回调必须原样回传发起查询时的 token(供调用方丢弃过期结果)。
+    func testTokenIsEchoed() {
+        let backend = SpotlightBackend(maxResults: 1)
+        let exp = expectation(description: "token")
+        var seen: UInt64?
+        var fulfilled = false
+        backend.onResults = { token, _ in
+            seen = token
+            if !fulfilled { fulfilled = true; exp.fulfill() }
+        }
+        backend.search(SearchQuery(), token: 42)
+        wait(for: [exp], timeout: 15)
+        XCTAssertEqual(seen, 42)
+    }
+
+    /// 无效 scope 不应崩溃,且应回退到全局(不抛异常、能拿到结果)。
+    func testInvalidScopeDoesNotCrash() {
+        let backend = SpotlightBackend(maxResults: 1)
+        let exp = expectation(description: "bad scope")
+        backend.onResults = { _, _ in exp.fulfill() }
+        guard let q = try? SearchQuery.parse("in:/definitely/not/here") else {
+            return XCTFail("parse failed")
+        }
+        backend.search(q, token: 1)   // 应回退为全局 scope
         wait(for: [exp], timeout: 15)
     }
 

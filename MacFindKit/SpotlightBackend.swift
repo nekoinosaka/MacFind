@@ -11,7 +11,10 @@ public final class SpotlightBackend {
     /// 最多回传的结果条数。
     public let maxResults: Int
     public private(set) var totalCount = 0
-    public var onResults: (([ResultItem]) -> Void)?
+    /// 回调携带发起查询时的 `token`,调用方据此丢弃过期结果。
+    public var onResults: ((_ token: UInt64, _ items: [ResultItem]) -> Void)?
+
+    private var activeToken: UInt64 = 0
 
     /// 合法的「匹配全部」谓词。
     public static func matchAllPredicate() -> NSPredicate {
@@ -39,18 +42,24 @@ public final class SpotlightBackend {
         observers.forEach { NotificationCenter.default.removeObserver($0) }
     }
 
-    public func search(_ q: SearchQuery) {
+    public func search(_ q: SearchQuery, token: UInt64 = 0) {
+        activeToken = token
         query.stop()
         query.predicate = q.predicate() ?? Self.matchAllPredicate()
-        if let scope = q.scope {
+        if let scope = q.scope, Self.isDirectory(scope) {
             query.searchScopes = [URL(fileURLWithPath: scope)]
         } else {
-            query.searchScopes = [NSMetadataQueryLocalComputerScope]
+            query.searchScopes = [NSMetadataQueryLocalComputerScope]   // 无效 scope 兜底,不抛异常
         }
         query.start()
     }
 
     public func stop() { query.stop() }
+
+    private static func isDirectory(_ path: String) -> Bool {
+        var isDir: ObjCBool = false
+        return FileManager.default.fileExists(atPath: path, isDirectory: &isDir) && isDir.boolValue
+    }
 
     private func handleUpdate() {
         query.disableUpdates()
@@ -65,7 +74,7 @@ public final class SpotlightBackend {
                   let item = Self.makeItem(from: md) else { continue }
             items.append(item)
         }
-        onResults?(items)
+        onResults?(activeToken, items)
     }
 
     private static func makeItem(from md: NSMetadataItem) -> ResultItem? {

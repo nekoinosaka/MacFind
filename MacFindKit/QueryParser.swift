@@ -1,10 +1,18 @@
 import Foundation
 
 /// 查询语法错误。
-public enum QueryParseError: Error, Equatable {
+public enum QueryParseError: Error, Equatable, LocalizedError {
     case invalidSize(String)
     case invalidDate(String)
     case unterminatedQuote
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidSize(let s):   return "无效的大小:\(s)(示例:size:>10M)"
+        case .invalidDate(let s):   return "无效的日期:\(s)(示例:date:7d / date:today / date:>2024-01-01)"
+        case .unterminatedQuote:    return "引号未闭合"
+        }
+    }
 }
 
 /// `kind:` 过滤器取值。
@@ -47,6 +55,16 @@ public struct SearchQuery: Equatable {
         literals.isEmpty && excludedLiterals.isEmpty
             && extensions.isEmpty && excludedExtensions.isEmpty
             && sizes.isEmpty && modifiedAfter == nil && kinds.isEmpty
+    }
+
+    /// `in:` 指向的目录是否存在且为目录;有问题时返回可直接展示的错误文案。
+    public func scopeValidationError(fileManager: FileManager = .default) -> String? {
+        guard let scope else { return nil }
+        var isDir: ObjCBool = false
+        guard fileManager.fileExists(atPath: scope, isDirectory: &isDir), isDir.boolValue else {
+            return "目录不存在或不是目录:\(scope)"
+        }
+        return nil
     }
 
     // MARK: - Parsing
@@ -137,7 +155,9 @@ public struct SearchQuery: Equatable {
             }
         }
         guard let n = Int64(rest), n >= 0 else { throw QueryParseError.invalidSize(s) }
-        return SizeConstraint(op: op, bytes: n * multiplier)
+        let (bytes, overflow) = n.multipliedReportingOverflow(by: multiplier)
+        guard !overflow else { throw QueryParseError.invalidSize(s) }   // ⚠️ 防 Int64 溢出崩溃
+        return SizeConstraint(op: op, bytes: bytes)
     }
 
     static func parseDate(_ s: String, now: Date) throws -> Date {
