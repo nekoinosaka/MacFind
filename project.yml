@@ -1,0 +1,74 @@
+name: MacFindApp
+options:
+  bundleIdPrefix: com.ray
+  deploymentTarget:
+    macOS: "13.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    ARCHS: arm64
+    ONLY_ACTIVE_ARCH: YES
+    MACOSX_DEPLOYMENT_TARGET: "13.0"
+    CODE_SIGNING_ALLOWED: NO
+    CODE_SIGNING_REQUIRED: NO
+    ENABLE_HARDENED_RUNTIME: NO
+
+targets:
+  MacFindKit:
+    type: library.static
+    platform: macOS
+    sources:
+      - path: MacFindKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ray.macfind.kit
+        GENERATE_INFOPLIST_FILE: YES
+        DEFINES_MODULE: YES
+
+  MacFindApp:
+    type: application
+    platform: macOS
+    sources:
+      - path: MacFindApp
+    dependencies:
+      - target: MacFindKit
+    info:
+      path: MacFindApp/Info.plist
+      properties:
+        LSMultipleInstancesProhibited: true
+        LSApplicationCategoryType: public.app-category.utilities
+        NSHumanReadableCopyright: ""
+        CFBundleIconFile: AppIcon
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ray.macfind
+        PRODUCT_NAME: MacFind
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        ENABLE_TESTABILITY: YES
+        SWIFT_STRICT_CONCURRENCY: minimal
+
+  MacFindKitTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: MacFindKitTests
+    dependencies:
+      - target: MacFindKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ray.macfind.kittests
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_STRICT_CONCURRENCY: minimal
+
+schemes:
+  MacFindApp:
+    build:
+      targets:
+        MacFindApp: all
+    test:
+      targets:
+        - MacFindKitTests
+      gatherCoverageData: false
