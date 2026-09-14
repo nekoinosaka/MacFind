@@ -10,9 +10,13 @@ final class SearchViewModel: ObservableObject {
     @Published var totalCount = 0
     @Published var elapsedMS: Double = 0
     @Published var isSearching = false
-    @Published var selected: Set<ResultItem.ID> = []
+    /// ⚠️ 故意不是 `@Published`:选中态由 NSTableView 自己持有,
+    /// 若经 SwiftUI 往返会在每次点选时重渲染 + 可能重选整片选中集(明显卡顿)。
+    var selected: Set<ResultItem.ID> = []
     /// 查询语法/目录错误;非 nil 时状态栏展示。
     @Published var parseError: String?
+    /// 结果操作(如移到废纸篓)失败时的错误。
+    @Published var actionError: String?
 
     private let backend = SpotlightBackend()
     private var debounceWork: DispatchWorkItem?
@@ -58,6 +62,7 @@ final class SearchViewModel: ObservableObject {
         }
 
         parseError = nil
+        actionError = nil
         if q.isEmpty {
             generation &+= 1
             backend.stop()
@@ -98,20 +103,45 @@ final class SearchViewModel: ObservableObject {
         }
     }
 
+    func open(_ item: ResultItem) {
+        NSWorkspace.shared.open(item.url)
+    }
+
+    func reveal(_ item: ResultItem) {
+        NSWorkspace.shared.activateFileViewerSelecting([item.url])
+    }
+
+    func copyPath(_ item: ResultItem) {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(item.path, forType: .string)
+    }
+
+    /// 移到废纸篓(可恢复),成功后立即从当前结果里移除。
+    func trash(_ item: ResultItem) {
+        do {
+            try FileManager.default.trashItem(at: item.url, resultingItemURL: nil)
+            actionError = nil
+            results.removeAll { $0.id == item.id }
+            totalCount = max(0, totalCount - 1)
+            selected.remove(item.id)
+        } catch {
+            actionError = "移到废纸篓失败:\(error.localizedDescription)"
+        }
+    }
+
     func openSelected() {
         guard let item = selectedItem else { return }
-        NSWorkspace.shared.open(item.url)
+        open(item)
     }
 
     func revealSelected() {
         guard let item = selectedItem else { return }
-        NSWorkspace.shared.activateFileViewerSelecting([item.url])
+        reveal(item)
     }
 
     func copySelectedPath() {
         guard let item = selectedItem else { return }
-        let pb = NSPasteboard.general
-        pb.clearContents()
-        pb.setString(item.path, forType: .string)
+        copyPath(item)
     }
 }
