@@ -33,8 +33,11 @@ struct ResultsTableView: NSViewRepresentable {
         tableView.target = context.coordinator
         tableView.doubleAction = #selector(Coordinator.doubleClicked(_:))
         tableView.menu = context.coordinator.makeContextMenu()
-        tableView.setDraggingSourceOperationMask([.copy, .delete], forLocal: false)   // .delete:拖到废纸篓
+        tableView.setDraggingSourceOperationMask(.every, forLocal: false)   // 含 .delete:拖到废纸篓
         tableView.onSpace = { [weak coordinator = context.coordinator] in coordinator?.togglePreview() }
+        tableView.onDragEnded = { [weak coordinator = context.coordinator] pasteboard, operation in
+            coordinator?.dragEnded(pasteboard: pasteboard, operation: operation)
+        }
 
         Self.addColumn(to: tableView, id: .name, title: "名称", width: 320, min: 180, max: 900, sortKey: "name")
         Self.addColumn(to: tableView, id: .size, title: "大小", width: 90, min: 60, max: 120, sortKey: "size")
@@ -133,13 +136,25 @@ struct ResultsTableView: NSViewRepresentable {
 
         func numberOfRows(in tableView: NSTableView) -> Int { displayItems.count }
 
-        /// 拖拽导出:提供文件 URL(多选拖拽时 AppKit 逐行调用)。
+        /// 拖拽导出:直接返回文件 `NSURL`——系统才会把它识别为「拖文件」,
+        /// 废纸篓/Finder 才能接受(手搓 NSPasteboardItem 字符串不行)。
         func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
             guard row >= 0, row < displayItems.count else { return nil }
-            let pb = NSPasteboardItem()
-            pb.setString(displayItems[row].url.absoluteString, forType: .fileURL)
-            pb.setString(displayItems[row].path, forType: .string)
-            return pb
+            return displayItems[row].url as NSURL
+        }
+
+        /// 拖拽结束时,若落地端选择 `.delete`(拖到废纸篓),**由源自己执行删除**——
+        /// 系统只会返回该操作,不会替我们删。
+        func dragEnded(pasteboard: NSPasteboard, operation: NSDragOperation) {
+            guard operation == .delete else { return }
+            let urls = (pasteboard.readObjects(forClasses: [NSURL.self],
+                                               options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
+            let paths = Set(urls.map(\.path))
+            for item in displayItems where paths.contains(item.path) {
+                if FileManager.default.fileExists(atPath: item.path) {   // 防重复删
+                    parent.onTrash(item)
+                }
+            }
         }
 
         // MARK: 选中态(仅表格持有)
@@ -363,6 +378,13 @@ struct ResultsTableView: NSViewRepresentable {
 /// Return 键 = 打开;Space 键 = QuickLook 预览。
 final class KeyTableView: NSTableView {
     var onSpace: (() -> Void)?
+    var onDragEnded: ((NSPasteboard, NSDragOperation) -> Void)?
+
+    override func draggingSession(_ session: NSDraggingSession,
+                                  endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        onDragEnded?(session.draggingPasteboard, operation)
+        super.draggingSession(session, endedAt: screenPoint, operation: operation)
+    }
 
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 36 || event.keyCode == 76 {   // Return / Enter
